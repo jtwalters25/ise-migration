@@ -1,6 +1,6 @@
 ﻿#===============================================================================
 # Microsoft FastTrack for Azure
-# Validate and export Logic Apps in an Integration Service Environment
+# List Connectors being used by the Logic Apps in an ISE across all resource groups
 # Based on https://github.com/wsilveiranz/iseexportutilities by Wagner Silveira
 #===============================================================================
 # Copyright © Microsoft Corporation.  All rights reserved.
@@ -9,18 +9,9 @@
 # LIMITED TO THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
 # FITNESS FOR A PARTICULAR PURPOSE.
 #===============================================================================
-
-# Import the AzureRM module if not already imported
-# Import-Module AzureRM
-
-# Parameters
-Param (
+param(
     [Parameter(Mandatory = $true)]
     [string]$subscriptionId,
-
-    [Parameter(Mandatory = $true)]
-    [string]$region,
-
     [Parameter(Mandatory = $false)]
     [string]$outputCsvPath = "ExportedLogicApps_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".csv"
 )
@@ -51,91 +42,38 @@ $resourceGroups = Get-AzResourceGroup
 # Iterate through each resource group
 foreach ($resourceGroup in $resourceGroups) {
     $resourceGroupName = $resourceGroup.ResourceGroupName
-
+    
+    # Get all the Logic Apps for the current resource group
     Get-AzResource -ResourceGroupName $resourceGroupName -ResourceType 'Microsoft.Logic/workflows' -ExpandProperties | ForEach-Object {
         $itemProperties = $_ | Select-Object Name -ExpandProperty Properties
         if ([bool]$itemProperties.PSObject.Properties['integrationServiceEnvironment']) {
             $logicAppDetail = [PSCustomObject]@{
                 ResourceGroupName = $resourceGroupName
+                LogicAppName = $_.Name
                 LogicAppResourceId = $_.ResourceId
                 ExportStatus = "Not Processed"  # Placeholder
                 PackageLink = "Not Available"   # Placeholder
+                ConnectorDetails = @()          # Array to store connector details
             }
+
+            # Get Logic App Content
+            $logicAppJson = Invoke-RestMethod -Uri $_.Properties.definition -Headers $head -ContentType 'application/json' -Method Get
+            $logicAppConnections = $logicAppJson.triggers | Where-Object { $_.type -eq "ApiConnection" } | Select-Object -Property name, id
+            
+            foreach ($connection in $logicAppConnections) {
+                $connectorDetail = [PSCustomObject]@{
+                    ConnectorName = $connection.name
+                    ConnectorId = $connection.id
+                }
+                $logicAppDetail.ConnectorDetails += $connectorDetail
+            }
+            
             $logicAppDetails += $logicAppDetail
         }
-    }
-}
-
-# Validate and Export each Logic App
-$validateSucceededCount = 0
-$validateFailedCount = 0
-$validateFailed = @()
-$exportSucceededCount = 0
-$exportFailedCount = 0
-$exportFailed = @()
-
-foreach ($logicAppDetail in $logicAppDetails) {
-    $currentLogicApp = $logicAppDetail.LogicAppResourceId
-    $resourceGroupName = $logicAppDetail.ResourceGroupName
-    $body = '{"properties":{"workflows":[{"id":"' + $currentLogicApp + '"}],"workflowExportOptions":""}}'
-
-    try {
-        $validateResponse = Invoke-WebRequest -UseBasicParsing $validateUrl -Headers $head -ContentType 'application/json' -Method POST -Body $body
-        if ($validateResponse.StatusCode -eq '200') {
-            $validateSucceededCount++
-            $validateResponseContent = ConvertFrom-Json -InputObject $validateResponse.Content
-
-            $exportResponse = Invoke-WebRequest -UseBasicParsing $exportUrl -Headers $head -ContentType 'application/json' -Method POST -Body $body
-            if ($exportResponse.StatusCode -eq '200') {
-                $exportSucceededCount++
-                $exportResponseContent = ConvertFrom-Json -InputObject $exportResponse.Content
-
-                # Update the export result object with additional details
-                $logicAppDetail.ExportStatus = "Success"
-                $logicAppDetail.PackageLink = $exportResponseContent.properties.packageLink.uri
-            } else {
-                $exportFailedCount++
-                $exportFailed += $currentLogicApp
-                $logicAppDetail.ExportStatus = "Failed"
-                $logicAppDetail.PackageLink = "Not Available"
-                $logicAppDetail.ExportDetails = "Status Code: $($exportResponse.StatusCode), Content: $($exportResponse.Content)"
-            }
-        } else {
-            $validateFailedCount++
-            $validateFailed += $currentLogicApp
-            $logicAppDetail.ExportStatus = "Validation Failed"
-            $logicAppDetail.PackageLink = "Not Available"
-            $logicAppDetail.ValidationDetails = "Status Code: $($validateResponse.StatusCode), Content: $($validateResponse.Content)"
-        }
-    } catch {
-        $validateFailedCount++
-        $validateFailed += $currentLogicApp
-        $logicAppDetail.ExportStatus = "Validation Failed"
-        $logicAppDetail.PackageLink = "Not Available"
-        $logicAppDetail.ValidationDetails = $_.Exception.Message
     }
 }
 
 # Output results to CSV
 $logicAppDetails | Export-Csv -Path $outputCsvPath -NoTypeInformation
 
-Write-Host "Logic Apps successfully validated: $validateSucceededCount" -ForegroundColor Green
-Write-Host "Logic Apps that failed validation: $validateFailedCount" -ForegroundColor Red
-Write-Host "Logic Apps successfully exported: $exportSucceededCount" -ForegroundColor Green
-Write-Host "Logic Apps that failed export: $exportFailedCount" -ForegroundColor Red
-
-if ($validateFailedCount -gt 0) {
-    Write-Host "Logic Apps that failed validation"
-    Write-Host "================================="
-    $validateFailed | ForEach-Object {
-        Write-Host $_
-    }
-}
-
-if ($exportFailedCount -gt 0) {
-    Write-Host "Logic Apps that failed export"
-    Write-Host "============================="
-    $exportFailed | ForEach-Object {
-        Write-Host $_
-    }
-}
+Write-Host "Logic Apps exported: $($logicAppDetails.Count)" -ForegroundColor Green
